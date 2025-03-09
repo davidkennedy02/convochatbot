@@ -526,14 +526,17 @@ def chat_loop(model, tokenizer):
     conversation_directory = "./conversations"
     os.makedirs(conversation_directory, exist_ok=True)
     
-    # Fallback responses when generation quality is poor
+    # Improved fallback responses with topic continuation capability
     fallback_responses = [
-        "I'm not sure I understand. Could you rephrase that?",
-        "Let me think about that differently...",
-        "I'm having trouble formulating a coherent response to that.",
-        "That's an interesting point. Can you elaborate?",
-        "I think I need more context to respond properly."
+        "I'd like to understand more about that. Could you elaborate?",
+        "That's an interesting point. What aspects of that do you enjoy most?",
+        "I'm curious to hear more about your thoughts on that subject.",
+        "Let's explore that topic further. What specifically interests you about it?",
+        "That's something I'd like to discuss more. Could you share more details?"
     ]
+    
+    # System prompt to guide model behavior
+    system_prompt = "You are a helpful and friendly assistant engaged in a casual conversation. Your responses are coherent, contextually relevant, and natural-sounding. When the user mentions a topic, you engage with that topic in a thoughtful way."
     
     while True:
         user_input = input("User: ")
@@ -582,13 +585,35 @@ def chat_loop(model, tokenizer):
         # Add user input to chat history
         chat_history.append(f"User: {user_input}")
         
-        # Prepare the input for the model (combine chat history)
-        # Use a more explicit prompt format to guide the model
+        # Extract last topic if available from previous exchanges
+        last_topic = ""
+        if len(chat_history) >= 3:  # We have at least one complete exchange plus current user input
+            last_bot_response = chat_history[-2].replace("Bot: ", "")
+            last_user_input = chat_history[-1].replace("User: ", "")
+            # Try to identify key nouns as topics using simple approach
+            potential_topics = set()
+            for msg in [last_bot_response, last_user_input]:
+                words = msg.split()
+                # Look for capitalized words or words following "the", "a", "an" as potential nouns
+                for i, word in enumerate(words):
+                    if (word[0].isupper() and i > 0) or \
+                       (i > 0 and words[i-1].lower() in ["the", "a", "an"]):
+                        potential_topics.add(word.strip(".,!?").lower())
+            if potential_topics:
+                last_topic = f" The conversation mentions: {', '.join(potential_topics)}."
+        
+        # Prepare the input for the model with improved prompting
         if len(chat_history) > 1:
-            context = chat_history[-min(len(chat_history), 5):]  # Use only last few exchanges
-            full_prompt = "This is a helpful and coherent conversation.\n" + "\n".join(context)
+            # Use more context for better coherence - last 4 exchanges
+            context = chat_history[-min(len(chat_history), 8):]  # Increased from 5 to 8
+            
+            # Format the prompt with stronger guidance
+            formatted_context = "\n".join(context)
+            full_prompt = (f"{system_prompt}{last_topic}\n\n"
+                          f"Conversation History:\n{formatted_context}\n\n"
+                          f"Please provide a natural, helpful response to the user's latest message.")
         else:
-            full_prompt = f"User: {user_input}"
+            full_prompt = f"{system_prompt}\n\nUser: {user_input}\n\nPlease respond to the user in a helpful and natural way."
         
         # Ensure we don't exceed model's max length by truncating history if needed
         encoded_prompt = tokenizer.encode(full_prompt, return_tensors="pt")[0]
@@ -596,34 +621,37 @@ def chat_loop(model, tokenizer):
             # Try to find sentence boundaries to truncate naturally
             while len(encoded_prompt) > max_history_tokens:
                 chat_history.pop(0)  # Remove oldest message
-                context = chat_history[-min(len(chat_history), 5):]
-                full_prompt = "This is a helpful and coherent conversation.\n" + "\n".join(context)
+                context = chat_history[-min(len(chat_history), 8)]
+                formatted_context = "\n".join(context)
+                full_prompt = (f"{system_prompt}{last_topic}\n\n"
+                              f"Conversation History:\n{formatted_context}\n\n"
+                              f"Please provide a natural, helpful response to the user's latest message.")
                 encoded_prompt = tokenizer.encode(full_prompt, return_tensors="pt")[0]
         
         input_ids = encoded_prompt.unsqueeze(0).to(device)
         
-        # Generate a response with better parameters and retry mechanism
+        # Generate a response with improved parameters
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                # Generate with improved parameters for more coherent responses
+                # Generate with adjusted parameters for more coherent responses
                 start_time = time.time()
                 output = model.generate(
                     input_ids,
-                    max_new_tokens=100,  # Allow longer responses
+                    max_new_tokens=150,  # Increased for more complete responses
                     pad_token_id=tokenizer.pad_token_id,
-                    temperature=0.5,  # Lower temperature for more focused responses
-                    top_p=0.92,
-                    top_k=40,
-                    repetition_penalty=1.3,  # Increased to reduce repetition
+                    temperature=0.7,  # Slightly increased for more variety
+                    top_p=0.95,
+                    top_k=50,
+                    repetition_penalty=1.2,
                     do_sample=True,
                     no_repeat_ngram_size=3,
                     early_stopping=True,
-                    num_beams=1,  # Simple sampling works better for casual conversation
+                    num_beams=3,  # Increased for better coherence
                     bad_words_ids=[[tokenizer.unk_token_id]] if hasattr(tokenizer, 'unk_token_id') else None
                 )
                 
-                # Check for extremely slow generation (possible infinite loop)
+                # Check for extremely slow generation
                 if time.time() - start_time > 10:
                     logger.warning("Response generation took too long")
                 
@@ -633,22 +661,54 @@ def chat_loop(model, tokenizer):
                 # Clean up the response
                 response = response.strip()
                 
-                # Remove any remaining special tokens manually
-                response = re.sub(r'<.*?>', '', response)
+                # Extract actual response from generated text
+                # Look for the response after the formatted prompt
+                response_markers = ["Bot:", "Assistant:", "Response:", "Reply:"]
+                extracted = False
+                for marker in response_markers:
+                    if marker in response:
+                        parts = response.split(marker, 1)
+                        if len(parts) > 1:
+                            response = parts[1].strip()
+                            extracted = True
+                            break
                 
-                # Split on common end markers
-                if "User:" in response:
-                    response = response.split("User:")[0].strip()
-                if "Bot:" in response:
-                    response = response.split("Bot:")[0].strip()
+                if not extracted:
+                    # If no marker found, try to get the first paragraph
+                    paragraphs = response.split('\n')
+                    if paragraphs:
+                        response = paragraphs[0].strip()
                 
-                # Check response quality
-                response_quality = assess_response_quality(response)
+                # Additional cleanup
+                response = re.sub(r'<.*?>', '', response)  # Remove any HTML-like tags
+                
+                # Remove any common assistant identifiers
+                response = re.sub(r'(?i)(assistant|AI):\s*', '', response)
+                
+                # Stop at any turn-taking markers
+                stop_phrases = ["User:", "Human:", "Person:", "You:", "Question:"]
+                for phrase in stop_phrases:
+                    if phrase in response:
+                        response = response.split(phrase)[0].strip()
+                
+                # Check response quality with improved assessment
+                response_quality = assess_response_quality(response, user_input)
                 
                 if response_quality == "poor" or not response:
-                    # Use a fallback response instead
-                    response = random.choice(fallback_responses)
+                    # Create a more contextual fallback response
+                    # Extract potential topic from user input for better fallback
+                    words = user_input.split()
+                    nouns = [word for word in words if len(word) > 3 and word.lower() not in 
+                             ["what", "when", "where", "which", "who", "whom", "whose", "why", "how"]]
+                    
+                    if nouns and random.random() < 0.7:  # 70% chance to use topic-specific fallback
+                        topic = random.choice(nouns).strip(".,!?")
+                        fallback = f"I'd like to hear more about {topic}. Could you tell me more about what interests you about it?"
+                    else:
+                        fallback = random.choice(fallback_responses)
+                        
                     logger.warning(f"Generated poor quality response, using fallback")
+                    response = fallback
                     
                 print(f"Bot: {response}")
                 chat_history.append(f"Bot: {response}")
@@ -668,12 +728,13 @@ def chat_loop(model, tokenizer):
                 print("Bot: Sorry, I couldn't generate a response right now.")
                 break
 
-def assess_response_quality(response):
+def assess_response_quality(response, user_input):
     """
     Assess the quality of a generated response
     
     Args:
         response: The text response to evaluate
+        user_input: The user's input for context
         
     Returns:
         quality: String indicating 'good', 'medium', or 'poor' quality
@@ -709,7 +770,35 @@ def assess_response_quality(response):
     if max_repetitions > 3 and len(words) > 10:
         return "poor"
         
-    # If it passed all checks, it's probably good enough
+    # New: Check for topical relevance to user input
+    user_words = set(user_input.lower().split())
+    response_words = set(response.lower().split())
+    
+    # Filter out common stop words
+    stop_words = {"the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "with", 
+                 "about", "is", "are", "am", "was", "were", "be", "been", "have", "has", "had",
+                 "do", "does", "did", "can", "could", "will", "would", "should", "may", "might",
+                 "must", "that", "this", "these", "those", "i", "you", "he", "she", "it", "we", "they"}
+    
+    user_content_words = {w for w in user_words if w not in stop_words and len(w) > 2}
+    response_content_words = {w for w in response_words if w not in stop_words and len(w) > 2}
+    
+    # If user input has content words but none are reflected in response, consider it less relevant
+    if (len(user_content_words) >= 2 and len(response_content_words) >= 3 and 
+        not any(w in response_content_words for w in user_content_words)):
+        # Allow if it's a question (the response asks for clarification)
+        if '?' in response and len(response) < 80:
+            return "good"
+        return "medium"  # Don't immediately fail but consider it medium quality
+        
+    # Check for nonsensical short responses with generic words
+    generic_responses = {"i am", "it is", "that is", "they are", "we are"}
+    if len(response) < 20 and any(phrase in response.lower() for phrase in generic_responses):
+        # Check if it's just a generic statement without context
+        if not any(w in response_content_words for w in user_content_words):
+            return "poor"
+    
+    # If it passed all checks, it's probably good
     return "good"
 
 # Main entry point.
